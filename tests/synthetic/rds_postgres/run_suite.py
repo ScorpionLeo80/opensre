@@ -227,16 +227,38 @@ def _build_resolved_integrations(
 ) -> dict[str, Any] | None:
     """Build pre-resolved integrations for injection into run_investigation."""
     integrations: dict[str, Any] = {}
+    aws_backend = FixtureAWSBackend(fixture)
+    annotations = fixture.alert.get("commonAnnotations") or {}
+    annotations = annotations if isinstance(annotations, dict) else {}
     if use_mock_grafana or grafana_backend is not None:
         integrations["grafana"] = {
             "endpoint": "",
             "api_key": "",
+            "pipeline_name": fixture.alert.get("commonLabels", {}).get(
+                "pipeline_name",
+                "",
+            ),
+            "service_name": fixture.metadata.db_instance_identifier,
             "_backend": grafana_backend or FixtureGrafanaBackend(fixture),
         }
     integrations["aws"] = {
         "region": fixture.metadata.region,
-        "ec2_backend": FixtureAWSBackend(fixture),
+        "ec2_backend": aws_backend,
     }
+    integrations["rds"] = {
+        "db_instance_identifier": fixture.metadata.db_instance_identifier,
+        "region": fixture.metadata.region,
+        "_backend": aws_backend,
+    }
+    if any(
+        source in fixture.metadata.available_evidence
+        for source in ("ec2_instances_by_tag", "elb_target_health")
+    ):
+        integrations["ec2"] = {
+            "region": fixture.metadata.region,
+            "vpc_id": str(annotations.get("vpc_id") or ""),
+            "_backend": aws_backend,
+        }
     return integrations
 
 

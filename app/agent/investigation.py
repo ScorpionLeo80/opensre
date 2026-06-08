@@ -107,7 +107,7 @@ def _context_budget_ceiling_for_model(model: str | None) -> int:
 _ALERT_SOURCE_TO_TOOL_SOURCES: dict[str, list[str]] = {
     "grafana": ["grafana"],
     "datadog": ["datadog"],
-    "cloudwatch": ["cloudwatch"],
+    "cloudwatch": ["cloudwatch", "grafana", "rds", "ec2"],
     "eks": ["eks"],
     "alertmanager": ["grafana", "cloudwatch"],
     "sentry": ["sentry"],
@@ -133,6 +133,30 @@ _ALERT_SOURCE_TO_TOOL_SOURCES: dict[str, list[str]] = {
     "signoz": ["signoz"],
     "jenkins": ["jenkins"],
 }
+
+_RDS_CLOUDWATCH_SEED_TOOL_NAMES = (
+    "query_grafana_metrics",
+    "query_grafana_logs",
+    "query_grafana_alert_rules",
+    "describe_rds_instance",
+    "describe_rds_events",
+)
+
+_RDS_EC2_SEED_TOOL_NAMES = (
+    "describe_rds_instance",
+    "describe_rds_events",
+    "ec2_instances_by_tag",
+    "get_elb_target_health",
+    "query_grafana_metrics",
+    "query_grafana_logs",
+)
+
+_SEED_FOLLOWUP_INSTRUCTION = (
+    "The primary investigation tools above have already run successfully. Do not repeat "
+    "a successful tool call. If this evidence is sufficient, produce the final diagnosis "
+    "now. Call another tool only to resolve a specific evidence gap, and state that gap "
+    "in your reasoning."
+)
 
 # Callback type: called with (event_kind, data_dict) during the agent loop.
 # event_kind values: "tool_start", "tool_end", "llm_start", "agent_start", "agent_end"
@@ -302,6 +326,7 @@ class ConnectedInvestigationAgent:
                 )
                 _record_tool_end(tc, output)
                 debug_print(f"[seed:{tc.name}] → {_summarise(output)}")
+            messages.append({"role": "user", "content": _SEED_FOLLOWUP_INSTRUCTION})
 
         # Size the trim ceiling to the ACTIVE model's context window. A flat
         # ceiling overflows smaller-window models (e.g. gpt-4o at 128k) because
@@ -791,7 +816,16 @@ def _build_seed_calls(
         return []
 
     resolved = state.get("resolved_integrations") or {}
-    seed_tools = [t for t in tools if str(t.source) in target_sources]
+    if alert_source == "cloudwatch" and _is_rds_alert(state):
+        tool_by_name = {tool.name: tool for tool in tools}
+        seed_names = (
+            _RDS_EC2_SEED_TOOL_NAMES if "ec2" in resolved else _RDS_CLOUDWATCH_SEED_TOOL_NAMES
+        )
+        seed_tools = [
+            tool_by_name[name] for name in seed_names if name in tool_by_name
+        ]
+    else:
+        seed_tools = [t for t in tools if str(t.source) in target_sources]
     if not seed_tools:
         return []
 
@@ -806,9 +840,33 @@ def _build_seed_calls(
         except Exception:
             injected = {}
         tool_id = new_tool_use_id() if use_converse_ids else f"seed_{tool.name}"
-        calls.append(ToolCall(id=tool_id, name=tool.name, input=_public_tool_input(injected)))
+        calls.append(
+            ToolCall(
+                id=tool_id,
+                name=tool.name,
+                input=_public_tool_input(injected, excluded_keys=set(tool.injected_params)),
+            )
+        )
 
     return calls
+
+
+def _is_rds_alert(state: dict[str, Any]) -> bool:
+    raw = state.get("raw_alert")
+    if not isinstance(raw, dict):
+        return False
+    labels = raw.get("commonLabels") or raw.get("labels") or {}
+    annotations = raw.get("commonAnnotations") or raw.get("annotations") or {}
+    labels = labels if isinstance(labels, dict) else {}
+    annotations = annotations if isinstance(annotations, dict) else {}
+    service = str(labels.get("service") or "").strip().lower()
+    return bool(
+        service == "rds"
+        or labels.get("engine")
+        or annotations.get("db_instance_identifier")
+        or annotations.get("db_instance")
+        or annotations.get("rds_failure_mode")
+    )
 
 
 def _get_alert_source(state: dict[str, Any]) -> str:
@@ -939,12 +997,20 @@ def _run_parallel(
     return results
 
 
-def _public_tool_input(value: dict[str, Any]) -> dict[str, Any]:
+def _public_tool_input(
+    value: dict[str, Any],
+    *,
+    excluded_keys: set[str] | None = None,
+) -> dict[str, Any]:
     redacted = redact_sensitive(value)
+    excluded = excluded_keys or set()
     return {
         key: item
         for key, item in redacted.items()
-        if item != "[runtime object]" and item != "[redacted]"
+        if key not in excluded
+        and item is not None
+        and item != "[runtime object]"
+        and item != "[redacted]"
     }
 
 
@@ -988,10 +1054,13 @@ def _merge_tool_evidence(
         return
 
     if tool_name == "query_grafana_logs":
-        evidence["grafana_logs"] = output.get("logs", [])
+        logs = output.get("logs", [])
+        evidence["grafana_logs"] = logs
         evidence["grafana_error_logs"] = output.get("error_logs", [])
         evidence["grafana_logs_query"] = output.get("query", "")
         evidence["grafana_logs_service"] = output.get("service_name", "")
+        if isinstance(logs, list):
+            _split_log_evidence_by_source(evidence, logs)
         return
 
     if tool_name == "query_grafana_metrics":
@@ -999,7 +1068,10 @@ def _merge_tool_evidence(
         metric_results = evidence.setdefault("grafana_metric_results", {})
         if isinstance(metric_results, dict) and metric_name:
             metric_results[metric_name] = output
-        evidence["grafana_metrics"] = output.get("metrics", [])
+        metrics = output.get("metrics", [])
+        evidence["grafana_metrics"] = metrics
+        if isinstance(metrics, list):
+            _split_metric_evidence_by_source(evidence, metrics)
         return
 
     if tool_name == "query_grafana_traces":
@@ -1013,6 +1085,71 @@ def _merge_tool_evidence(
 
     if tool_name == "query_grafana_service_names":
         evidence["grafana_service_names"] = output.get("service_names", [])
+        return
+
+    if tool_name == "describe_rds_events":
+        evidence["aws_rds_events"] = output.get("events", [])
+        return
+
+    if tool_name == "get_elb_target_health":
+        evidence["elb_target_health"] = output
+
+
+def _split_metric_evidence_by_source(
+    evidence: dict[str, Any],
+    metrics: list[dict[str, Any]],
+) -> None:
+    cloudwatch_metrics: list[dict[str, Any]] = []
+    source_metrics: dict[str, list[dict[str, Any]]] = {}
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        labels = metric.get("metric") or {}
+        labels = labels if isinstance(labels, dict) else {}
+        source_type = str(labels.get("source_type") or "")
+        if source_type.startswith("k8s_"):
+            source_metrics.setdefault(source_type, []).append(metric)
+        else:
+            cloudwatch_metrics.append(metric)
+
+    if cloudwatch_metrics:
+        evidence["aws_cloudwatch_metrics"] = {
+            "metrics": cloudwatch_metrics,
+        }
+    for source_type, items in source_metrics.items():
+        evidence[source_type] = {
+            "metrics": items,
+        }
+
+
+def _split_log_evidence_by_source(
+    evidence: dict[str, Any],
+    logs: list[dict[str, Any]],
+) -> None:
+    rds_events: list[dict[str, Any]] = []
+    performance_insights: list[dict[str, Any]] = []
+    source_logs: dict[str, list[dict[str, Any]]] = {}
+    for log in logs:
+        if not isinstance(log, dict):
+            continue
+        source_type = str(log.get("source_type") or "")
+        if source_type == "aws_performance_insights":
+            performance_insights.append(log)
+        elif source_type.startswith("k8s_"):
+            source_logs.setdefault(source_type, []).append(log)
+        else:
+            rds_events.append(log)
+
+    if rds_events:
+        evidence["aws_rds_events"] = rds_events
+    if performance_insights:
+        evidence["aws_performance_insights"] = {
+            "observations": [str(item.get("message") or "") for item in performance_insights],
+        }
+    for source_type, items in source_logs.items():
+        evidence[source_type] = {
+            "logs": items,
+        }
 
 
 def _build_assistant_msg(llm: Any, response: Any) -> dict[str, Any]:

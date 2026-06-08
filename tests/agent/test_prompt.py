@@ -3,13 +3,12 @@ from __future__ import annotations
 from app.agent.prompt import build_system_prompt, format_alert_context
 
 
-def test_build_system_prompt_non_hermes_uses_generic_category_instruction() -> None:
+def test_build_system_prompt_non_hermes_requests_specific_category() -> None:
     prompt = build_system_prompt({"alert_source": "grafana"})
 
-    assert (
-        "One of database / infrastructure / code_bug / configuration / network / performance"
-        in prompt
-    )
+    assert "A concise, specific snake_case category" in prompt
+    assert "Avoid broad categories such as database or infrastructure" in prompt
+    assert "Preserve the exact names of decisive metrics" in prompt
     assert "Hermes root cause category taxonomy" not in prompt
     assert "agent_hang" not in prompt
 

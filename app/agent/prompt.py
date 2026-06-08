@@ -24,6 +24,8 @@ Your task: investigate the alert below and produce a clear, evidence-backed root
 - If a tool returns an error or empty result, try another tool from the same integration before giving up.
 - If all evidence points to healthy service, say so clearly (root_cause_category = healthy).
 - Be specific: include error messages, timestamps, service names, namespaces, run IDs.
+- Preserve the exact names of decisive metrics, database wait events, and error codes in the
+  final diagnosis and validated claims (for example Client:ClientRead or FreeStorageSpace).
 - **Only call tools listed under "Available tools".** Do not fabricate tool calls for integrations not listed.
 
 ## What to produce at the end
@@ -98,8 +100,11 @@ _ALERT_SOURCE_TO_TOOL_SOURCES: dict[str, list[str]] = {
 _SECONDARY_SOURCES = {"knowledge", "openclaw", "google_docs"}
 
 _DEFAULT_ROOT_CAUSE_CATEGORY_INSTRUCTION = (
-    "One of database / infrastructure / code_bug / configuration / network / performance / "
-    "healthy / unknown"
+    "A concise, specific snake_case category that identifies the failure mode "
+    "(for example storage_exhaustion, connection_exhaustion, replication_lag, "
+    "cpu_saturation_bad_query, network_failure, healthy, or unknown). Avoid broad "
+    "categories such as database or infrastructure when the evidence supports a "
+    "more precise failure mode."
 )
 
 
